@@ -1,0 +1,347 @@
+---
+title: "topic model"
+author: "JB"
+date: "3/8/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE)
+
+library(tidyverse)
+library(topicmodels)
+library(tidytext)
+library(SnowballC)
+library(LDAvis)
+library(textstem)
+library(scales)
+```
+
+```{r}
+## @knitr AriaDataTopicPrep
+##
+
+reviews <- read_csv('../data/reviews_cleaned/Animation.csv')
+
+## get text into tidy format, replace a few special words and remove stop words
+reviewsTidy <- reviews %>%
+  unnest_tokens(word, review_text) %>%
+  anti_join(stop_words)
+
+## get raw word frequencies  
+
+wordCount <- reviewsTidy %>%
+  count(word,sort = TRUE)
+
+## remove common words and lemmatize remaining
+commonWords <- c('animation', 'animations', 'film', 'films')
+
+reviewsTidy <- reviewsTidy %>%
+  mutate(lemma = lemmatize_words(word))
+
+wordCount <- reviewsTidy %>%
+  count(lemma,sort = TRUE)
+
+## remove infrequent words 
+freqLimit <- 20
+vocab <- wordCount %>%
+  filter(n >= freqLimit)
+
+reviewsTidy <- reviewsTidy %>%
+  filter(lemma %in% vocab$lemma) %>%
+  filter(!lemma %in% commonWords)
+
+
+## remove very short reviews
+
+reviewLength <- reviewsTidy %>%
+  count(imdbId)
+
+minLength <- 50
+
+reviewLength <- reviewLength %>%
+  filter(n >= minLength)
+
+## create document term matrix for use in LDA 
+
+dtmUni <- reviewsTidy %>%
+  filter(imdbId %in% reviewLength$imdbId) %>%
+  count(imdbId,lemma) %>%
+  cast_dtm(imdbId, lemma, n)
+
+
+## @knitr RunLDA
+
+numTopics <- c(10,20,30,40)
+
+
+for (theNum in c(1:length(numTopics))){
+  theLDA <- LDA(dtmUni, k = numTopics[theNum], method="Gibbs",
+                control = list(alpha = 1/numTopics[theNum],iter=5000,burnin=10000,seed = 1234))
+  
+  saveRDS(theLDA,file=paste0('topic_animation_r',numTopics[theNum],'.rds'))
+}
+
+
+
+
+## @knitr AnalyzeTopics
+
+theNumTopics <- 20
+theLDA <- read_rds(paste0('data/ldaAria',theNumTopics,'.rds'))
+
+theTopicsBeta <- tidy(theLDA, matrix = "beta")
+
+TopicsTop <- theTopicsBeta %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta) %>%
+  ungroup() %>%
+  mutate(x = n():1)  # for plotting
+
+plTopicWeights <- TopicsTop %>%
+  mutate(topic=factor(topic)) %>%
+  ggplot(aes(x=x,y=beta,fill=topic)) + 
+  geom_bar(stat='identity',show.legend = F) + 
+  coord_flip() + 
+  facet_wrap(~topic,scales='free') +
+  scale_x_continuous(breaks = TopicsTop$x,
+                     labels = TopicsTop$term,
+                     expand = c(0,0)) + 
+  labs(title='Top Words by Topic',
+       subtitle = paste0(theNumTopics,' Topic LDA of ',
+                         prettyNum(nrow(reviewLength),big.mark=",",scientific=FALSE), ' TripAdvisor Reviews'),
+       x = 'word',
+       y = 'beta')+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size=5),
+        axis.text.y = element_text(size = 6))
+
+
+## @knitr TopicSimilarity
+
+theTopicsBetaW <- select(spread(tidy(theLDA, matrix = "beta"),term,beta),-topic)
+theTopicsGammaW <- select(spread(tidy(theLDA, matrix = "gamma"),topic,gamma),-document)
+theTerms <- colnames(theTopicsBetaW)
+
+theVocab <- vocab %>%
+  mutate(word = factor(lemma1,levels=theTerms)) %>%
+  arrange(word) %>%
+  mutate(word=as.character(word))
+
+json <- createJSON(
+  phi = theTopicsBetaW, 
+  theta = theTopicsGammaW, 
+  doc.length = reviewLength$n, 
+  vocab = theTerms, 
+  R = theNumTopics,
+  term.frequency = theVocab$n
+)
+
+serVis(json)
+
+
+## @knitr WordTopicAssignments 
+
+assignments <- augment(theLDA, data = dtmUni)
+
+theDocID <- '309501149'
+theDoc <- assignments %>%
+  filter(document == theDocID)
+
+
+tmp <- reviewsTidy %>% 
+  filter(reviewID == theDocID) %>%
+  left_join(select(theDoc,term,.topic), by = c('lemma'='term')) %>%
+  distinct()
+
+
+
+theOrg <- reviews %>%
+  filter(reviewID==theDocID) %>%
+  select(reviewID,reviewText) %>%
+  unnest_tokens(word,reviewText) %>%
+  left_join(select(tmp,word,.topic), by = 'word') %>%
+  mutate(wordID = row_number())
+
+theBreaks <- c(1:10)
+theY <- c(100:1)
+dfIndex <- data.frame( y = rep(theY,each = length(theBreaks)),
+                       x = rep(theBreaks, length(theY)) ) %>%
+  mutate(wordID = row_number())
+
+
+theOrg %>%
+  left_join(dfIndex, by = 'wordID') %>%
+  ggplot(aes(x=factor(x),y=y,label=word,color=factor(.topic))) + 
+  geom_text() + 
+  theme_bw() + 
+  labs(x = '', y = '', title = paste0('ReviewID ',theDocID)) + 
+  scale_color_discrete(name="Topic") + 
+  theme(panel.grid.minor=element_blank(),
+        panel.grid.major=element_blank(),
+        axis.ticks = element_blank(), 
+        axis.text = element_blank())
+
+
+## @knitr ReviewClustering 
+
+
+theTopicsGamma <- tidy(theLDA, matrix = "gamma")
+
+theSampleReviews <- reviewLength %>%
+  sample_n(5)
+
+theTopicsGamma %>%
+  filter(document %in% theSampleReviews$reviewID) %>%
+  ggplot(aes(x=topic,y=gamma,fill=document)) + 
+  geom_bar(stat='identity') + 
+  facet_wrap(~document,ncol = 1) + 
+  theme(legend.position = 'none') + 
+  scale_y_continuous(labels = percent) + 
+  labs(title = '5 Random Reviews',
+       y = 'Topic Weight (Gamma)')
+
+
+## @knitr TopicEvolution
+
+theTopicsGamma <- tidy(theLDA, matrix = "gamma") %>%
+  inner_join(reviews,by=c('document'='reviewID'))
+
+theTopicsGamma %>%
+  group_by(topic,year) %>%
+  summarize(mean = mean(gamma)) %>%
+  ggplot(aes(x=year,y=mean,group=topic)) + geom_line() + 
+  facet_wrap(~topic,labeller = label_both) + 
+  scale_y_continuous(labels = percent) + 
+  labs(title = 'Topic Evolution', x = 'Year of Review', y = 'Average Topic Weight') + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+
+## @knitr TopicSentiments
+
+theTopicsGamma <- tidy(theLDA, matrix = "gamma") %>%
+  inner_join(reviews,by=c('document'='reviewID'))
+
+theTopicsGamma %>%
+  group_by(reviewRating,topic) %>%
+  summarize(mean = mean(gamma)) %>%
+  mutate(topic = factor(topic)) %>%
+  ggplot(aes(x=reviewRating,y=mean,fill=topic)) + 
+  geom_bar(stat='identity') + 
+  facet_wrap(~topic, scales = 'free', labeller = label_both) + 
+  scale_y_continuous(labels = percent) + 
+  theme(legend.position = 'none') + 
+  labs(title = 'Topic Weights by Star Rating', x = 'Rating', y = 'Average Topic Weight')  
+  
+
+
+
+## @knitr LDAAriaUniandBigrams
+
+reviewsTidyUni <- reviewsTidy %>%
+  group_by(reviewID) %>%
+  mutate(wordNumber = row_number())  %>%
+  ungroup()
+
+
+## all reviews 
+tmpUni <-  reviewsTidyUni %>%
+  rename(lemma1 = lemma) %>%
+  mutate(lemma2 = lead(lemma1),
+         Index1 = wordNumber,
+         Index2 = lead(wordNumber),
+         bilemma = paste0(lemma1,'_',lemma2)) 
+
+BiLimit <- 100 
+
+freqBi <- tmpUni %>%
+  count(bilemma,sort = T) %>%
+  filter(n >= BiLimit)
+
+newBi <- tmpUni %>%
+  filter(bilemma %in% freqBi$bilemma)
+
+tmpRemoveRows <- newBi %>%
+  select(Index1,Index2,bilemma,reviewID) %>%
+  gather(Index,wordNumber,-bilemma,-reviewID) %>%
+  select(reviewID,wordNumber)
+
+newBi <- newBi %>%
+  select(reviewID,bilemma) %>%
+  rename(lemma1 = bilemma) 
+
+reviewsTidyUniBi <- tmpUni %>%
+  anti_join(tmpRemoveRows,by = c('reviewID','wordNumber')) %>%
+  select(reviewID,lemma1) %>%
+  bind_rows(newBi)
+
+vocab <- reviewsTidyUniBi %>%
+  count(lemma1,sort = T) %>%
+  filter(n >= 20)
+
+reviewsTidyUniBi <- reviewsTidyUniBi %>%
+  filter(lemma1 %in% vocab$lemma1)
+
+
+## remove very short reviews
+
+reviewLength <- reviewsTidyUniBi %>%
+  count(reviewID)
+
+minLength <- 30
+
+reviewLength <- reviewLength %>%
+  filter(n >= minLength)
+
+## create document term matrix for use in LDA 
+
+dtmBi <- reviewsTidyUniBi %>%
+  filter(reviewID %in% reviewLength$reviewID) %>%
+  count(reviewID,lemma1) %>%
+  cast_dtm(reviewID, lemma1, n)
+
+
+numTopics <- c(10,20,30,40)
+
+
+for (theNum in c(1:length(numTopics))){
+  theLDA <- LDA(dtmBi, k = numTopics[theNum], method="Gibbs",
+                control = list(alpha = 1/numTopics[theNum],iter=5000,burnin=10000,seed = 1234))
+  
+  saveRDS(theLDA,file=paste0('data/ldaAria_Bi',numTopics[theNum],'.rds'))
+}
+
+## @knitr AnalyzeTopicsUniBi
+
+theNumTopics <- 20
+theLDA <- read_rds(paste0('data/ldaAria_Bi',theNumTopics,'.rds'))
+
+theTopicsBeta <- tidy(theLDA, matrix = "beta")
+
+TopicsTop <- theTopicsBeta %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta) %>%
+  ungroup() %>%
+  mutate(x = n():1)  # for plotting
+
+plTopicWeights <- TopicsTop %>%
+  mutate(topic=factor(topic)) %>%
+  ggplot(aes(x=x,y=beta,fill=topic)) + 
+  geom_bar(stat='identity',show.legend = F) + 
+  coord_flip() + 
+  facet_wrap(~topic,scales='free') +
+  scale_x_continuous(breaks = TopicsTop$x,
+                     labels = TopicsTop$term,
+                     expand = c(0,0)) + 
+  labs(title='Topic Model with both Unigrams and Bigrams',
+       subtitle = paste0(theNumTopics,' Topic LDA of ',
+                         prettyNum(nrow(reviewLength),big.mark=",",scientific=FALSE), ' TripAdvisor Reviews'),
+       x = 'word',
+       y = 'beta')+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size=5),
+        axis.text.y = element_text(size = 6))
+
+```
